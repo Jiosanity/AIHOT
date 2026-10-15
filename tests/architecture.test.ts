@@ -135,7 +135,7 @@ const envReads = (files: Array<{ text: string }>) => new Set(files.flatMap(({ te
 const assigned = (file: string, pattern: RegExp) => [...readFileSync(path.join(ROOT, file), "utf8").matchAll(pattern)].map((m) => m[1]!);
 
 // .env.example is the template. A deployment's own files, where the repository has them, set the rest
-// themselves: docker-compose.yml the container settings (database address, data folder, hosts and
+// themselves: the Compose files the container settings (database address, data folder, hosts and
 // ports), the Caddyfile the HTTPS domain; a server deployment may keep its own templates beside it
 // (`<name>.env.example`) and set a few in its systemd units (`Environment=`). Keys and secrets are read by name through credential(group,
 // NAME) or a model preset, so a name the code gives whole as a string counts as read, and so does one a
@@ -144,7 +144,7 @@ const matches = (text: string, pattern: RegExp) => [...text.matchAll(pattern)].m
 const NAMED = /["']([A-Z][A-Z0-9_]+)["']/g;
 const SUBSTITUTED = /\$\{([A-Z][A-Z0-9_]+)|\{\$([A-Z][A-Z0-9_]+)\}/g;
 const COMPOSE = "docker-compose.yml";
-const DEPLOYMENT = [COMPOSE, "deploy/Caddyfile"].filter((file) => existsSync(path.join(ROOT, file)));
+const DEPLOYMENT = [COMPOSE, "docker-compose.ghcr.yml", "deploy/Caddyfile"].filter((file) => existsSync(path.join(ROOT, file)));
 const tracked = (pattern: string) => execFileSync("git", ["ls-files", "--", pattern], { cwd: ROOT, encoding: "utf8" }).split("\n").filter(Boolean);
 
 test("every environment variable the code reads is listed in a template, and every listed one is read", () => {

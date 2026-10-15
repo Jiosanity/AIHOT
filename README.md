@@ -108,6 +108,8 @@
 
 ## 跑起来
 
+本 fork 的 GHCR 镜像发布、直接拉取部署与上游同步方案，见 [Fork 部署说明](docs/fork-deploy.md)。
+
 想创建自己的独立站点，可以先点 [Use this template](https://github.com/KKKKhazix/AIHOT/generate)，再克隆你生成的仓库。想持续合并上游更新或贡献代码，建议先 Fork。下面的命令适合直接试用。
 
 需要 [Docker](https://docs.docker.com/get-started/get-docker/)、[Node.js 24](https://nodejs.org/en/download)（运行 `init-env` 生成配置要用），和一个 OpenAI 兼容的模型 API Key（DeepSeek、千问、智谱都可以）。

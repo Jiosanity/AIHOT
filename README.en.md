@@ -109,6 +109,8 @@ The same thing happens once: the official site posts it, ten outlets repeat it, 
 
 ## Run it
 
+For this fork's GHCR image publishing, image-based deployment, and upstream sync strategy, see the [fork deployment guide](docs/fork-deploy.md) (Chinese).
+
 To create your own independent site, click [Use this template](https://github.com/KKKKhazix/AIHOT/generate) and clone the repository it creates. To keep merging upstream updates or to contribute, fork it instead. The commands below are for trying it out directly.
 
 You need [Docker](https://docs.docker.com/get-started/get-docker/), [Node.js 24](https://nodejs.org/en/download) (to run `init-env`, which generates the configuration), and an API key for any OpenAI-compatible model API (DeepSeek, Qwen, Zhipu GLM and so on).

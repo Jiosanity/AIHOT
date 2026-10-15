@@ -1,0 +1,15 @@
+# Use with docker-compose.yml; keep service settings and volumes in the upstream file.
+# docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d --no-build
+x-image: &image
+  build: !reset null
+  image: ${DEPLOY_IMAGE:-ghcr.io/jiosanity/aihot:latest}
+
+services:
+  setup:
+    <<: *image
+  api:
+    <<: *image
+  worker:
+    <<: *image
+  web:
+    <<: *image

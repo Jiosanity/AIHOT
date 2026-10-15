@@ -1,0 +1,72 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '17 1 * * *' # Daily at 09:17 Asia/Shanghai (UTC+8).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'Jiosanity/AIHOT'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      UPSTREAM_REPOSITORY: KKKKhazix/AIHOT
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Open or find the upstream pull request
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git fetch "https://github.com/$UPSTREAM_REPOSITORY.git" main
+          upstream_sha=$(git rev-parse FETCH_HEAD)
+          if git merge-base --is-ancestor "$upstream_sha" origin/main; then
+            echo "main already contains upstream main." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Use the upstream branch directly: its later commits update the same PR automatically.
+          # This also syncs workflow files without storing a PAT with workflow-writing permission.
+          upstream_head="${UPSTREAM_REPOSITORY%%/*}:main"
+          pr_number=$(gh api --method GET "repos/$GITHUB_REPOSITORY/pulls" \
+            -f state=open -f base=main -f head="$upstream_head" --jq '.[0].number // empty')
+          if [ -z "$pr_number" ]; then
+            cat > "$RUNNER_TEMP/upstream-pr.md" <<'BODY'
+          同步 KKKKhazix/AIHOT 的 main，保留本 fork 的镜像发布与站点定制。
+
+          请检查文件差异和 docs/deploy.md 的升级说明，确认 Check 通过后再合并。
+          如果检查等待批准，请点击 Approve workflows to run；本 PR 使用 GitHub Actions 的默认令牌创建。
+
+          请使用 Create a merge commit 合并，保留上游提交历史，不要 squash 或 rebase。
+          合并后由现有工作流检查 main 并发布 GHCR 镜像；服务器更新仍需备份和执行迁移。
+          BODY
+            gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$upstream_head" \
+              --title 'chore: sync upstream main' --body-file "$RUNNER_TEMP/upstream-pr.md"
+          else
+            echo "Existing sync PR #$pr_number already follows upstream main." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Compute the merge without changing branches or executing upstream code.
+          if git merge-tree --write-tree origin/main "$upstream_sha" > "$RUNNER_TEMP/upstream-merge.txt"; then
+            echo 'Upstream PR is ready for review and checks.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '### Upstream sync needs manual conflict resolution' >> "$GITHUB_STEP_SUMMARY"
+            cat "$RUNNER_TEMP/upstream-merge.txt" >> "$GITHUB_STEP_SUMMARY"
+            echo '::error::Review the sync PR and resolve conflicts using docs/fork-deploy.md.'
+            exit 1
+          fi

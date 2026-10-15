@@ -60,7 +60,7 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm --no-bu
 
 ## 持续跟进上游
 
-建议采用：**每小时检查上游 → 有更新时创建或更新一条同步 PR → 人工处理冲突并审阅 → 检查通过后合入 main → 自动发布镜像 → 按上述步骤更新服务器**。目前仓库只配置了镜像发布，尚未启用定时同步或服务器自动更新。
+已配置：**每天北京时间 09:17 检查上游 → 有更新时创建或更新一条同步 PR → 人工处理冲突并审阅 → 检查通过后合入 main → 自动发布镜像 → 按上述步骤更新服务器**。没有更新时不创建 PR。同步不会自动合并或更新服务器。
 
 上游频繁更新时，不宜用强制同步或 `reset --hard upstream/main` 覆盖自己的分支，否则镜像工作流、站点配置和行业定制也会被覆盖。用普通 merge 保留双方历史；`site/`、`industry/` 出现冲突时逐项决定，不要一律选择某一方。
 
@@ -71,22 +71,26 @@ docker compose -f docker-compose.yml -f docker-compose.ghcr.yml run --rm --no-bu
 ```bash
 git fetch origin
 git fetch upstream
-git switch -c sync-upstream origin/main
+git switch -c codex/manual-sync-upstream origin/main
 git merge upstream/main
 ```
 
 处理冲突、检查 `docs/deploy.md` 的升级说明并完成项目检查后，将该分支推送到自己的 fork：
 
 ```bash
-git push -u origin sync-upstream
+git push -u origin codex/manual-sync-upstream
 ```
 
-在 **Jiosanity/AIHOT** 中创建从 `sync-upstream` 到 `main` 的 PR。保留 merge 提交，用普通 merge 合并同步 PR，使上游提交继续作为 `main` 的祖先；不要 squash 或 rebase 同步 PR，避免后续重复同步相同的上游历史。GitHub 网页的 [Sync fork](https://docs.github.com/en/pull-requests/how-tos/work-with-forks/syncing-a-fork) 也可用于手动同步，但仍需处理冲突和升级说明。
+在 **Jiosanity/AIHOT** 中创建从 `codex/manual-sync-upstream` 到 `main` 的 PR。保留 merge 提交，用普通 merge 合并同步 PR，使上游提交继续作为 `main` 的祖先；不要 squash 或 rebase 同步 PR，避免后续重复同步相同的上游历史。GitHub 网页的 [Sync fork](https://docs.github.com/en/pull-requests/how-tos/work-with-forks/syncing-a-fork) 也可用于手动同步，但仍需处理冲突和升级说明。
 
-### 定时监测怎么做
+### 定时同步的运行与权限
 
-后续可在 fork 增加单独的同步工作流，按小时比较上游 `main` 与本仓库 `main` 的提交历史；没有新提交时结束，有更新时维护固定同步分支和一条 PR。冲突时让工作流失败并提供日志，人工解决后继续，不自动丢弃定制。
+工作流是 `.github/workflows/sync-upstream.yml`，仅在 `Jiosanity/AIHOT` 运行。每天 01:17 UTC（北京时间 09:17）执行一次，也可以在 **Actions → Sync upstream → Run workflow** 手动执行。自动创建从 `KKKKhazix:main` 到本 fork `main` 的 PR，后续上游提交自动进入同一条未合并 PR；没有新提交时不创建 PR，也不会推送或修改任何分支。
+
+在仓库 **Settings → Actions → General → Workflow permissions** 中开启 **Allow GitHub Actions to create and approve pull requests**；工作流自身只申请读取代码与写入 PR 的权限，使用自带的 `GITHUB_TOKEN`，无需配置 PAT。直接使用上游分支也能同步工作流文件，无需额外保存具有工作流写入权限的令牌。若组织策略禁止此权限，需要由有权修改该策略的人开启。
+
+工作流用 Git 计算合并结果，不执行上游代码。冲突时保留同步 PR，工作流失败，Actions 摘要列出冲突信息。按上方「手动同步」在自己的 fork 建分支解决冲突，改用该分支的 PR 合并；完成后关闭原来的自动同步 PR。不要为了解决冲突去修改上游仓库。失败通知由 GitHub 的 Actions 通知设置决定。
 
 GitHub Actions 的定时检查属于轮询，可能排队延迟；公共仓库 60 天没有活动时，定时工作流可能自动停用，因此不能承诺严格实时。详见 [定时工作流规则](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)。真正由上游每次提交立即触发，需要上游维护者配合 webhook 或额外的外部监听服务。
 
-实现自动同步时还需考虑 [工作流触发规则](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow#triggering-a-workflow-from-a-workflow)：使用默认 `GITHUB_TOKEN` 推送的提交不会再次触发 push 工作流。同步机器人创建 PR 后，应按平台要求批准工作流运行，或使用权限受限的 GitHub App / PAT 触发检查；不能假定机器人推送后检查和镜像发布一定会自动开始。
+根据 [工作流触发规则](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow#triggering-a-workflow-from-a-workflow)，使用默认 `GITHUB_TOKEN` 创建或更新的 PR，其检查可能等待人工批准；在 PR 页面点击 **Approve workflows to run**。检查通过后，由你用 **Create a merge commit** 合并到 `main`，正常触发主分支检查与镜像发布。同步工作流不会自动批准检查或合并 PR。

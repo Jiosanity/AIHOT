@@ -55,7 +55,8 @@ jobs:
           请使用 Create a merge commit 合并，保留上游提交历史，不要 squash 或 rebase。
           合并后由现有工作流检查 main 并发布 GHCR 镜像；服务器更新仍需备份和执行迁移。
           BODY
-            gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$upstream_head" \
+            # The token cannot grant maintainers write access to the upstream head branch.
+            gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$upstream_head" --no-maintainer-edit \
               --title 'chore: sync upstream main' --body-file "$RUNNER_TEMP/upstream-pr.md"
           else
             echo "Existing sync PR #$pr_number already follows upstream main." >> "$GITHUB_STEP_SUMMARY"

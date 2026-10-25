@@ -89,6 +89,8 @@ git push -u origin codex/manual-sync-upstream
 
 在仓库 **Settings → Actions → General → Workflow permissions** 中开启 **Allow GitHub Actions to create and approve pull requests**；工作流自身只申请读取代码与写入 PR 的权限，使用自带的 `GITHUB_TOKEN`，无需配置 PAT。直接使用上游分支也能同步工作流文件，无需额外保存具有工作流写入权限的令牌。若组织策略禁止此权限，需要由有权修改该策略的人开启。
 
+创建 PR 时必须保留 `--no-maintainer-edit`：GitHub CLI 默认允许目标仓库维护者修改 PR 的来源分支，但这里的来源分支属于上游仓库，本 fork 的令牌无权授予这项权限。缺少该参数会报 `Fork collab can't be granted by someone without permission`；这不是扩大本 fork 的令牌权限就能解决的问题。
+
 工作流用 Git 计算合并结果，不执行上游代码。冲突时保留同步 PR，工作流失败，Actions 摘要列出冲突信息。按上方「手动同步」在自己的 fork 建分支解决冲突，改用该分支的 PR 合并；完成后关闭原来的自动同步 PR。不要为了解决冲突去修改上游仓库。失败通知由 GitHub 的 Actions 通知设置决定。
 
 GitHub Actions 的定时检查属于轮询，可能排队延迟；公共仓库 60 天没有活动时，定时工作流可能自动停用，因此不能承诺严格实时。详见 [定时工作流规则](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)。真正由上游每次提交立即触发，需要上游维护者配合 webhook 或额外的外部监听服务。

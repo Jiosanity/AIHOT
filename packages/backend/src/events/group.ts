@@ -12,26 +12,29 @@
 // report is firmly tied to two stories, their roots are compared directly and the stories merge
 // when both models see one story (consolidate.ts); stories that stay apart though reports keep tying
 // them list each other as related (linkRelatedStories). A story a regrouped report leaves without
-// reports merges into where it went, so its address keeps working. Discussion posts that found no
-// story get another look when a report founds a fact close to them (rematchSignals); history
+// reports merges into where it went, so its address keeps working. A discussion post is recalled by
+// reports and by the posts already attached to a fact; one that found no story gets another look,
+// while it still counts for heat, whenever a fact close to it gains evidence (rematchSignals). History
 // (isHistorical) founds no event. Runs serially (queue concurrency 1).
-import { modelFor } from "../editorial/models.ts";
-import { beijingDate } from "@aihot/contracts/time";
+import { modelFor, modelRoute } from "../editorial/models.ts";
+import { beijingDate, beijingMidnight } from "@aihot/contracts/time";
 import { sql, type Db, type Tx } from "../db.ts";
 import { newShortId, newUuid } from "../lib/ids.ts";
 import { chatJson } from "../providers/llm.ts";
-import { BudgetExceededError, completeReceipt } from "../providers/receipts.ts";
+import { completeReceipt, failedReceiptId, failureKind } from "../providers/receipts.ts";
 import { embeddingsAvailable } from "../providers/embeddings.ts";
-import { isHistorical, STALE_ON_DISCOVERY_MS } from "../content/materials.ts";
+import { isHistorical, newsCondition } from "../content/materials.ts";
 import { enqueue, QUEUES, shutdownSignal } from "../jobs/queue.ts";
+import { groupingPriority } from "../jobs/content.ts";
 import { publishArticle, publishArticleTx } from "../publication/publish.ts";
 import { latestCompositeCondition } from "../publication/scope.ts";
 import { consolidate, liveStory, type Consolidation } from "./consolidate.ts";
+import { HEAT_WINDOW_HOURS } from "./hot.ts";
 import { mergeStoryInto } from "./merge.ts";
-import { candidateViews, cosine32, recallFacts, recallSelectedBackground, relatedPosts, vectorsFor } from "./recall.ts";
+import { bestPerFact, candidateViews, cosine32, recallFacts, recallFactsByPosts, recallSelectedBackground, relatedPosts, vectorsFor, type Recalled } from "./recall.ts";
 import {
   BATCH_SYSTEM, BATCH_PROMPT_VERSION, BatchSchema, PAIR_SYSTEM, PairSchema, RELATE_PROMPT_VERSION, SIGNAL_SYSTEM, SignalSchema, TIE_MIN_CONFIDENCE,
-  batchUser, completeDecisions, firmlyTied, pairUser, reportText, sameOccurrence, signalTarget, storyForDevelopment, verdictsByFact,
+  batchUser, completeDecisions, firmlyTied, pairUser, reportText, sameOccurrence, signalTarget, signalText, storyForDevelopment, verdictsByFact,
   type CandidateView, type ReadingContext, type Relation, type ReportView, type SelectionValue, type Verdict,
 } from "./relate.ts";
 
@@ -39,9 +42,15 @@ const RECALL_MIN_COSINE = 0.6;
 const RECALL_TOP_FACTS = 10;
 /** A merge with a candidate less similar than this is confirmed by the review model before it is written. */
 const CONFIRM_BELOW_COSINE = 0.85;
-/** Discussion posts are judged only against clear candidates, and attach without a call when nearly identical. */
+/** Discussion posts are judged only against clear candidates, and attach without a call when nearly identical to a report. */
 const SIGNAL_MIN_COSINE = 0.72;
 const SIGNAL_AUTO_COSINE = 0.92;
+/**
+ * A post this close to a post already attached to a fact is judged against that fact (never attached
+ * without the judge). Posts about one happening paraphrase each other more closely than its reports;
+ * below this, the judge's yes was wrong or doubtful far more often.
+ */
+const SIGNAL_PEER_MIN_COSINE = 0.78;
 const SIGNAL_TOP_FACTS = 4;
 
 interface ArticleRow {
@@ -50,6 +59,7 @@ interface ArticleRow {
   title: string;
   url: string;
   published_at: Date | null;
+  publication_time: string | null;
   discovered_at: Date;
   grouped_at: Date | null;
   body_text: string | null;
@@ -76,7 +86,7 @@ const NO_SELECTED_COVERAGE: SelectionValue = { addsValue: true, reason: "没有�
 
 async function judgeBatch(articleId: string, query: ReportView, cands: CandidateView[], reading: ReadingContext[]): Promise<{ verdicts: Map<number, Verdict>; selection: SelectionValue; receiptId: number }> {
   const res = await chatJson({
-    model: await modelFor("group"), purpose: "group_article", subject: `article:${articleId}`, promptVersion: BATCH_PROMPT_VERSION,
+    ...await modelRoute("group"), purpose: "group_article", subject: `article:${articleId}`, promptVersion: BATCH_PROMPT_VERSION,
     system: BATCH_SYSTEM, user: batchUser(query, cands, "新报道", reading), schema: BatchSchema.refine(value => completeDecisions(value.decisions, cands.length), "Every candidate requires exactly one decision"), temperature: 0, maxTokens: 400 + 120 * cands.length,
   });
   return { verdicts: verdictsByFact(res.data.decisions, cands), selection: cands.some(c => c.selected) || reading.length ? res.data.selection : NO_SELECTED_COVERAGE, receiptId: res.receiptId };
@@ -93,7 +103,7 @@ async function confirmMerge(articleId: string, query: ReportView, cand: Candidat
 
 async function judgeSignal(articleId: string, query: ReportView, cands: CandidateView[]): Promise<{ verdicts: Map<number, Verdict>; receiptId: number }> {
   const res = await chatJson({
-    model: await modelFor("group"), purpose: "group_signal", subject: `article:${articleId}`, promptVersion: RELATE_PROMPT_VERSION,
+    ...await modelRoute("group"), purpose: "group_signal", subject: `article:${articleId}`, promptVersion: RELATE_PROMPT_VERSION,
     system: SIGNAL_SYSTEM, user: batchUser(query, cands, "帖子"), schema: SignalSchema.refine(value => completeDecisions(value.decisions, cands.length), "Every candidate requires exactly one decision"), temperature: 0, maxTokens: 150 + 60 * cands.length,
   });
   return { verdicts: verdictsByFact(res.data.decisions, cands), receiptId: res.receiptId };
@@ -109,7 +119,7 @@ async function createStory(db: Db, title: string, at: Date): Promise<number> {
 }
 
 async function createFact(db: Db, storyId: number, title: string, frame: Record<string, any> | null, at: Date): Promise<number> {
-  let occurred = typeof frame?.occurredAt === "string" && /^\d{4}-\d{2}-\d{2}$/.test(frame.occurredAt) ? new Date(`${frame.occurredAt}T00:00:00+08:00`) : null;
+  let occurred = typeof frame?.occurredAt === "string" && /^\d{4}-\d{2}-\d{2}$/.test(frame.occurredAt) ? beijingMidnight(frame.occurredAt) : null;
   if (occurred && (!Number.isFinite(+occurred) || beijingDate(occurred) !== frame!.occurredAt)) occurred = null;
   const conditions = Array.isArray(frame?.conditions) ? frame.conditions.map((c: { text?: string }) => c.text).filter(Boolean).join("；") || null : null;
   const [row] = await db<{ id: number }[]>`
@@ -216,7 +226,7 @@ export interface GroupResult {
   consolidationError?: string;
   /** Stories left without reports when this report moved: merged into its story, their public ids redirect. */
   redirected?: number[];
-  /** Earlier discussion posts close to the fact this report founded, grouped again (rematchSignals). */
+  /** Unattached discussion posts close to this new evidence of a fact, grouped again (rematchSignals). */
   rematched?: number;
   /** Earlier discussion posts replying to or quoting this post, grouped again (reclaimWaiting). */
   reclaimed?: number;
@@ -227,6 +237,8 @@ export interface GroupResult {
 export interface GroupOptions {
   /** Discussion evidence only (hot_signal sources): attach to a story, never create one. */
   signalOnly?: boolean;
+  /** An editor asked for this decision again (requestRegroup): a discussion post's answered facts are offered again. */
+  regroup?: boolean;
 }
 
 export async function groupArticle(articleId: string, opts: GroupOptions = {}): Promise<GroupResult> {
@@ -249,20 +261,25 @@ export async function groupArticle(articleId: string, opts: GroupOptions = {}): 
     await publishArticle(articleId);
     return result;
   } catch (error) {
-    const receiptId = error && typeof error === 'object' && 'receiptId' in error && typeof error.receiptId === 'number' ? error.receiptId : null;
     // A late failed model call must not undo an editor's completed decision, or a fact already
-    // committed before an optional downstream operation failed. Shutdown and budget waits leave work pending.
-    await sql`UPDATE articles SET grouping_status = ${shutdownSignal.signal.aborted || error instanceof BudgetExceededError ? 'pending' : 'failed'},
-      grouped_at = NULL, grouping_receipt_id = ${receiptId}, grouping_error = ${String(error).slice(0, 2000)}
+    // committed before an optional downstream operation failed. Shutdown, budget waits and an unbilled
+    // provider outage (every route rejected the request as retryable) leave work pending for the repair sweep.
+    const kind = failureKind(error);
+    const waiting = shutdownSignal.signal.aborted || kind === "budget" || kind === "outage";
+    await sql`UPDATE articles SET grouping_status = ${waiting ? 'pending' : 'failed'},
+      grouped_at = NULL, grouping_receipt_id = ${failedReceiptId(error)}, grouping_error = ${String(error).slice(0, 2000)}
       WHERE id = ${articleId} AND revision = ${revision} AND grouping_status <> 'complete' AND ${!(error instanceof GroupingSupersededError)}`;
     await publishArticle(articleId);
     throw error;
   }
 }
 
+/** An analysis that says the material cannot establish what the current news is: grouping confirms no fact for it. */
+export const unsupportedMaterial = (output: Record<string, any> | null | undefined): boolean => output?.scope === "unknown" && !output.fact;
+
 async function decide(articleId: string, opts: GroupOptions, revision: number, recheckSelection: boolean): Promise<GroupResult> {
   const [a] = await sql<ArticleRow[]>`
-    SELECT a.id, a.revision, a.title, a.url, a.published_at, a.discovered_at, a.grouped_at, a.body_text, a.x_post, a.backfill,
+    SELECT a.id, a.revision, a.title, a.url, a.published_at, a.publication_time, a.discovered_at, a.grouped_at, a.body_text, a.x_post, a.backfill,
            s.id AS source_id, s.name AS source_name, s.signal_group_id, (s.tier = 'T1') AS first_party, s.participation_mode
     FROM articles a JOIN sources s ON s.id = a.source_id WHERE a.id = ${articleId}`;
   if (a && a.revision !== revision) throw new GroupingSupersededError("Grouping input changed before it was read");
@@ -283,7 +300,7 @@ async function decide(articleId: string, opts: GroupOptions, revision: number, r
     throw new GroupingSupersededError("Current material revision is still waiting for analysis");
   }
   const composite = an?.composite === true;
-  const unsupported = an?.output?.scope === "unknown" && !an.output.fact;
+  const unsupported = unsupportedMaterial(an?.output);
   const historical = isHistorical(a);
   const left = composite || unsupported || historical
     ? await sql.begin(async (tx) => { await lockCurrentRevision(tx, articleId, a.revision); return resetAutomatic(tx, articleId); })
@@ -295,7 +312,7 @@ async function decide(articleId: string, opts: GroupOptions, revision: number, r
     return { verdict: "historical" };
   }
 
-  if (opts.signalOnly || a.participation_mode !== "editorial") return groupSignal(a, source, observedAt);
+  if (opts.signalOnly || a.participation_mode !== "editorial") return groupSignal(a, source, observedAt, opts.regroup === true);
 
   // Explicitly insufficient material supplies no event identity. A missing (older) scope is separate.
   if (unsupported) {
@@ -319,7 +336,7 @@ async function decide(articleId: string, opts: GroupOptions, revision: number, r
   }
   const title = an.title_zh || a.title;
   const query: ReportView = {
-    title, source: a.source_name, firstParty: a.first_party, at: observedAt, summary: an.summary_zh,
+    title, source: a.source_name, firstParty: a.first_party, at: a.published_at, publicationTime: a.publication_time, summary: an.summary_zh,
     scope: composite ? "composite" : an.output?.scope === "single" ? "single" : "unknown",
     frame: frame ? { subject: frame.subject, action: frame.action, object: frame.object, occurredAt: frame.occurredAt } : null,
   };
@@ -332,7 +349,7 @@ async function decide(articleId: string, opts: GroupOptions, revision: number, r
   }]))[0]?.selected === true;
   const cands = selectedSameUrl ? [] : await candidateViews(await recallFacts(articleId,
     reportText(title, an.summary_zh), RECALL_MIN_COSINE, RECALL_TOP_FACTS, [...referenced, ...(sameUrl ? [sameUrl] : [])]));
-  const reading = selectedSameUrl ? [] : await recallSelectedBackground(articleId, reportText(title, an.summary_zh), RECALL_MIN_COSINE);
+  const reading = selectedSameUrl ? [] : await recallSelectedBackground(articleId, reportText(title, an.summary_zh), RECALL_MIN_COSINE, cands.map(c => c.factId));
   let verdicts = new Map<number, Verdict>();
   let selection = NO_SELECTED_COVERAGE;
   const receipts: number[] = [];
@@ -487,29 +504,28 @@ async function decide(articleId: string, opts: GroupOptions, revision: number, r
       result.reclaimError = String(error).slice(0, 300);
     }
   }
-  // A new fact may be what discussion posts of the last hours were about before any report came.
-  if (verdict === "new-story" || verdict === "new-fact-in-story") {
-    try {
-      result.rematched = await rematchSignals(articleId, reportText(title, an.summary_zh));
-    } catch (error) {
-      result.rematchError = String(error).slice(0, 300);
-    }
-  }
+  // The fact, new or not, may now be what earlier discussion posts were about in other words.
+  await rematch(result, articleId, reportText(title, an.summary_zh), written.factId!, SIGNAL_MIN_COSINE);
   return result;
 }
 
-/** How far back discussion posts that found no story get another look when a new fact appears. */
-const REMATCH_HOURS = 6;
 /** How long a discussion post waits for the post it replies to or quotes. */
 const WAIT_HOURS = 48;
 
 /** Discussion posts not yet attached to any story (a post a person placed or detached is left alone). */
 const unattachedSignal = sql`
-  s.participation_mode = 'hot_signal' AND a.processing_state = 'skipped'
-  AND (NOT a.backfill OR a.discovered_at - a.published_at <= make_interval(secs => ${STALE_ON_DISCOVERY_MS / 1000}))
+  s.participation_mode = 'hot_signal' AND a.processing_state = 'skipped' AND ${newsCondition}
   AND NOT EXISTS (SELECT 1 FROM story_signals ss WHERE ss.article_id = a.id)
   AND NOT EXISTS (SELECT 1 FROM grouping_decisions d WHERE d.article_id = a.id AND d.verdict <> 'signal-unmatched')
   AND NOT EXISTS (SELECT 1 FROM grouping_overrides o WHERE o.article_id = a.id)`;
+
+/**
+ * The facts the judge already answered for while leaving discussion post `article` unattached: it is
+ * not asked about them again (an attachment it made stays open to an editor's regroup).
+ */
+const answeredFacts = (article: ReturnType<typeof sql>) => sql`ARRAY(
+  SELECT (c->>'id')::bigint FROM grouping_decisions j CROSS JOIN LATERAL jsonb_array_elements(j.candidates) c
+  WHERE j.article_id = ${article} AND j.verdict = 'signal-unmatched')`;
 
 /**
  * A reaction often comes before the post it quotes is collected (Dan Shipper's "SONNET 5.5 IS OUT!"
@@ -521,46 +537,58 @@ async function reclaimWaiting(tweetId: string): Promise<number> {
     SELECT a.id FROM articles a JOIN sources s ON s.id = a.source_id
     WHERE a.discovered_at > now() - make_interval(hours => ${WAIT_HOURS}) AND ${unattachedSignal}
       AND (a.x_post->>'replyTo' = ${tweetId} OR substring(a.x_post->'quoted'->>'url' from '/status/([0-9]+)') = ${tweetId})`;
-  for (const p of posts) await enqueue(QUEUES.group, { articleId: p.id, signalOnly: true }, { singletonKey: p.id, priority: -1 });
+  for (const p of posts) await enqueue(QUEUES.group, { articleId: p.id, signalOnly: true }, { singletonKey: p.id, priority: groupingPriority({ signal: true, historical: false }) });
   return posts.length;
 }
 
-/** The text a discussion post is recalled by: its title and the start of its body. */
-const signalText = (a: { title: string; body_text: string | null }) => reportText(a.title, a.body_text?.slice(0, 300) ?? null);
-
 /**
- * Discussion posts often come before the first report (Techmeme, reactions): they found no story
- * then and were left. When a report founds a fact, the recent unattached posts close to it are
- * grouped again; each is judged the usual way, against all candidates.
+ * Discussion posts often come before what ties them to a fact: the first report (Techmeme, reactions),
+ * or a report or post that puts the news in their words. Whenever a fact gains evidence (a report
+ * founds or joins it, a post attaches to it), the unattached posts close to that evidence that still
+ * count for heat are grouped again, each judged the usual way against all candidates. A post the judge
+ * already answered for this fact is left as it is.
  */
-async function rematchSignals(articleId: string, queryText: string): Promise<number> {
+async function rematchSignals(articleId: string, queryText: string, factId: number, minScore: number): Promise<number> {
   if (!embeddingsAvailable()) return 0;
   const mine = (await vectorsFor([{ id: articleId, text: queryText }])).get(articleId);
   if (!mine) return 0;
   const posts = await sql<{ id: string; title: string; body_text: string | null }[]>`
-    SELECT a.id, a.title, a.body_text FROM articles a JOIN sources s ON s.id = a.source_id
-    WHERE a.discovered_at > now() - make_interval(hours => ${REMATCH_HOURS}) AND ${unattachedSignal}`;
+    SELECT a.id, a.title, left(a.body_text, 300) AS body_text FROM articles a JOIN sources s ON s.id = a.source_id
+    WHERE a.discovered_at > now() - make_interval(hours => ${HEAT_WINDOW_HOURS})
+      AND coalesce(a.published_at, a.discovered_at) > now() - make_interval(hours => ${HEAT_WINDOW_HOURS}) AND ${unattachedSignal}
+      AND NOT ${factId}::bigint = ANY(${answeredFacts(sql`a.id`)})`;
   const vectors = await vectorsFor(posts.map((p) => ({ id: p.id, text: signalText(p) })));
   let close = 0;
   for (const p of posts) {
     const v = vectors.get(p.id);
-    if (!v || cosine32(mine, v) < SIGNAL_MIN_COSINE) continue;
-    // A post still waiting in the queue keeps that job (same key): it will meet the new fact anyway.
-    await enqueue(QUEUES.group, { articleId: p.id, signalOnly: true }, { singletonKey: p.id, priority: -1 });
+    if (!v || cosine32(mine, v) < minScore) continue;
+    // A post still waiting in the queue keeps that job (same key): it will meet the new evidence anyway.
+    await enqueue(QUEUES.group, { articleId: p.id, signalOnly: true }, { singletonKey: p.id, priority: groupingPriority({ signal: true, historical: false }) });
     close += 1;
   }
   return close;
 }
 
+/** Best effort: the decision that brought the evidence is written; a failed look is reported in the job's result. */
+async function rematch(result: GroupResult, articleId: string, text: string, factId: number, minScore: number): Promise<void> {
+  try {
+    result.rematched = await rematchSignals(articleId, text, factId, minScore);
+  } catch (error) {
+    result.rematchError = String(error).slice(0, 300);
+  }
+}
+
 /**
  * Discussion evidence (hot_signal sources): the post the item replies to or quotes decides first;
- * otherwise clear candidates are judged, and a nearly identical report attaches without a call.
+ * otherwise clear candidates, recalled by reports and by the posts already attached, are judged, and a
+ * nearly identical report attaches without a call.
  */
-async function groupSignal(a: ArticleRow, source: { id: string; signal_group_id: string | null }, observedAt: Date): Promise<GroupResult> {
+async function groupSignal(a: ArticleRow, source: { id: string; signal_group_id: string | null }, observedAt: Date, regroup: boolean): Promise<GroupResult> {
+  const text = signalText(a);
   // Discussion evidence obeys the same article lock and last-minute manual check as reports. The
   // evidence and decision commit together; a retry cannot leave half of a signal attached.
   const write = async (target: { factId: number; storyId: number } | null, verdict: "signal" | "signal-native" | "signal-unmatched", candidates: DecisionCandidate[], receiptId: number | null = null): Promise<GroupResult> => {
-    return sql.begin(async (tx) => {
+    const result: GroupResult = await sql.begin(async (tx) => {
       await lockCurrentRevision(tx, a.id, a.revision);
       const manual = await manualDecision(tx, a.id);
       if (!manual) {
@@ -570,6 +598,9 @@ async function groupSignal(a: ArticleRow, source: { id: string; signal_group_id:
       if (receiptId !== null) await completeReceipt(tx, receiptId);
       return manual ? { verdict: "manual", factId: manual.factId } : { verdict, ...(target ? { storyId: target.storyId } : {}) };
     });
+    // The posts that came first and say what this one says may now be about its fact too.
+    if (target && result.verdict !== "manual") await rematch(result, a.id, text, target.factId, SIGNAL_PEER_MIN_COSINE);
+    return result;
   };
   const { referenced } = await relatedPosts(a);
   if (referenced.length) {
@@ -577,21 +608,24 @@ async function groupSignal(a: ArticleRow, source: { id: string; signal_group_id:
     return write({ factId: target.fact_id, storyId: target.story_id }, "signal-native", [{ id: target.fact_id, score: 1, relation: "SAME_STORY", confidence: 1 }]);
   }
   if (!embeddingsAvailable()) return { verdict: "signal-unmatched" };
-  const recalled = await recallFacts(a.id, signalText(a), SIGNAL_MIN_COSINE, SIGNAL_TOP_FACTS);
+  const asCandidates = (recalled: Recalled[], verdicts?: Map<number, Verdict>): DecisionCandidate[] =>
+    recalled.map((r) => ({ id: r.factId, score: Math.round(r.score * 1000) / 1000, relation: verdicts?.get(r.factId)?.relation, confidence: verdicts?.get(r.factId)?.confidence }));
+  const answered = new Set(regroup ? [] : (await sql<{ id: number }[]>`SELECT unnest(${answeredFacts(sql`${a.id}`)}) AS id`).map((r) => r.id));
+  const open = (recalled: Recalled[]) => recalled.filter((r) => !answered.has(r.factId));
+  const byReports = open(await recallFacts(a.id, text, SIGNAL_MIN_COSINE, Infinity));
+  if (byReports[0] && byReports[0].score >= SIGNAL_AUTO_COSINE) {
+    return write(byReports[0], "signal", asCandidates(byReports.slice(0, SIGNAL_TOP_FACTS)));
+  }
+  const byPosts = open(await recallFactsByPosts(a.id, text, SIGNAL_PEER_MIN_COSINE, HEAT_WINDOW_HOURS));
+  const recalled = bestPerFact([...byReports, ...byPosts], SIGNAL_TOP_FACTS);
   if (recalled.length === 0) {
     // Recorded, so a post that found nothing is told apart from one never decided.
     return write(null, "signal-unmatched", []);
   }
-  const top = recalled[0]!;
-  const asCandidates = (verdicts?: Map<number, Verdict>): DecisionCandidate[] =>
-    recalled.map((r) => ({ id: r.factId, score: Math.round(r.score * 1000) / 1000, relation: verdicts?.get(r.factId)?.relation, confidence: verdicts?.get(r.factId)?.confidence }));
-  if (top.score >= SIGNAL_AUTO_COSINE) {
-    return write(top, "signal", asCandidates());
-  }
   const cands = await candidateViews(recalled);
   if (cands.length === 0) return { verdict: "signal-unmatched" };
-  const query: ReportView = { title: a.title, source: a.source_name, firstParty: false, at: observedAt, summary: a.body_text?.slice(0, 300) ?? null };
+  const query: ReportView = { title: a.title, source: a.source_name, firstParty: false, at: a.published_at, publicationTime: a.publication_time, summary: a.body_text?.slice(0, 300) ?? null };
   const { verdicts, receiptId } = await judgeSignal(a.id, query, cands);
   const target = signalTarget(cands, verdicts);
-  return write(target, target ? "signal" : "signal-unmatched", asCandidates(verdicts), receiptId);
+  return write(target, target ? "signal" : "signal-unmatched", asCandidates(recalled, verdicts), receiptId);
 }
